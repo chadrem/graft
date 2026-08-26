@@ -1,0 +1,39 @@
+# graft configuration — copy to your repo root as .graftrc and edit.
+#
+# This file is sourced as shell by graft. Environment variables of the same
+# name override whatever is set here. Every setting is optional; the defaults
+# below are what graft uses when the file is absent.
+
+# Subdirectory of the worktree to start the session in. Leave empty to start at
+# the worktree root. Set this in a monorepo where CLAUDE.md, .claude/skills/ and
+# .claude/settings.local.json live below the git root — none of that is
+# discovered from the root, so starting there silently loses your project
+# skills.
+#GRAFT_SUBDIR=
+
+# Where worktrees are created, relative to the repo root. Add it to .gitignore.
+#GRAFT_WORKTREE_DIR=.claude/worktrees
+
+# Branch names are <prefix><worktree name>.
+#GRAFT_BRANCH_PREFIX=graft/
+
+# The branch new worktrees fork from, and the one "unlanded commits" is counted
+# against. Default: origin/HEAD, falling back to main, master, then trunk.
+#GRAFT_BASE_BRANCH=main
+
+# Gitignored files to copy from the primary checkout into a new worktree,
+# relative to the repo root. A fresh worktree has none of these, so without
+# seeding it may not boot (missing credentials key) or may run with no MCP
+# servers at all — MCP connects at session startup, so copying .mcp.json in
+# mid-session is too late. Missing sources and existing destinations are
+# skipped. The default is the list below, each entry under GRAFT_SUBDIR when
+# that is set.
+#GRAFT_SEED_FILES='config/master.key .env .claude/settings.local.json .mcp.json'
+
+# Longest permitted worktree name. Worktree paths end up inside unix domain
+# socket paths (a Rails parallel-test DRb socket, for one), and macOS gives
+# those only 104 bytes. Raise it if your toolchain does not care.
+#GRAFT_MAX_NAME=24
+
+# The CLI graft launches.
+#GRAFT_CLAUDE_BIN=claude

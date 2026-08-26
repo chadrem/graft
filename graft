@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+# graft — launch a Claude Code session in a throwaway git worktree.
+#
+# Usage:
+#   graft                    create a worktree (unique generated name)
+#   graft --list             what exists, what's live, what to type
+#   graft <name> [args]      reopen (exact, unique prefix, or substring)
+#   graft --new <name>       create with an explicit name, or rebuild a
+#                            deleted path so its sessions resume
+#   graft -c                 reopen the most recently active worktree
+#
+# Anything after the name is passed straight through to `claude`.
+#
+# Why not `claude --worktree`? Two reasons. It starts the session at the git
+# root, which loses project config that lives in a subdirectory (see
+# GRAFT_SUBDIR), and it recycles worktree names.
+#
+# Names are NEVER reused. Claude Code binds a session to its literal cwd:
+# transcripts live in ~/.claude/projects/<cwd-slug>/, and --continue means
+# "the most recent conversation in this directory". A recycled name therefore
+# pools unrelated features under one path and resumes the wrong one. Generated
+# names carry an <MMDD>-<HHMM> stamp, and a bare label gets one appended
+# (fix-login -> fix-login-0825-1449).
+#
+# Because a bare argument means REOPEN, it matches loosely: exact name first,
+# then unique prefix, then unique substring. Use --new to force creation.
+#
+# Creates <worktree dir>/<name> on a new branch based on the default branch,
+# seeds the gitignored files a fresh checkout needs, then runs `claude` in it.
+# If the branch still exists but the directory is gone, the worktree is
+# re-attached at the same path — which is exactly what an old session needs to
+# resume, since its transcripts are keyed to that path.
+#
+# On exit, mirrors `claude --worktree`'s cleanup: when the worktree has no
+# uncommitted changes, no in-progress rebase/merge, and no commits missing from
+# the base branch, offers to delete it; otherwise keeps it and says why.
+#
+# Configuration — set in <repo root>/.graftrc (sourced as shell) or as
+# environment variables, which win over the file. See .graftrc.example.
+#
+#   GRAFT_SUBDIR         subdirectory of the worktree to start the session in.
+#                        Default '' (the worktree root). Set this when your
+#                        CLAUDE.md and .claude/ live in a subdirectory of a
+#                        monorepo — starting there restores full parity with a
+#                        normal `claude` session.
+#   GRAFT_WORKTREE_DIR   where worktrees are created, relative to the repo
+#                        root. Default '.claude/worktrees'. Gitignore it.
+#   GRAFT_BRANCH_PREFIX  branch name prefix. Default 'graft/'.
+#   GRAFT_BASE_BRANCH    branch new worktrees branch from, and the one
+#                        "unlanded commits" is measured against. Default:
+#                        origin/HEAD, else main, master or trunk.
+#   GRAFT_SEED_FILES     space-separated gitignored files to copy from the
+#                        primary checkout into a new worktree, relative to the
+#                        repo root. Missing sources and existing destinations
+#                        are skipped. Default: config/master.key, .env,
+#                        .claude/settings.local.json and .mcp.json, each under
+#                        GRAFT_SUBDIR when that is set.
+#   GRAFT_MAX_NAME       longest permitted worktree name. Default 24.
+#   GRAFT_CLAUDE_BIN     the CLI to launch. Default 'claude'.
+set -euo pipefail
+
+PROG=${0##*/}
+
+# Only the leading comment block is help; body comments are not.
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
+
+if [ "${1:-}" = '-h' ] || [ "${1:-}" = '--help' ]; then
+  usage
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Repo and configuration
+# ---------------------------------------------------------------------------
+
+# The primary (non-linked) checkout is always the first entry in the list, even
+# when this script is run from inside another worktree. awk is used rather than
+# `head -1` because head closes the pipe early and pipefail reports the SIGPIPE.
+# `|| PRIMARY=''` matters: without it, pipefail plus a git that exits 128
+# outside a repo kills the script before the friendlier message below.
+PRIMARY=$(git worktree list --porcelain 2>/dev/null \
+  | awk 'NR==1 && $1 == "worktree" { print $2 }') || PRIMARY=''
+if [ -z "$PRIMARY" ]; then
+  echo "error: not inside a git repository" >&2
+  exit 1
+fi
+
+# Environment beats .graftrc: snapshot what the environment set, source the
+# file, then put the snapshot back.
+GRAFT_VARS='GRAFT_SUBDIR GRAFT_WORKTREE_DIR GRAFT_BRANCH_PREFIX GRAFT_BASE_BRANCH
+            GRAFT_SEED_FILES GRAFT_MAX_NAME GRAFT_CLAUDE_BIN'
+for v in $GRAFT_VARS; do
+  if [ -n "${!v-}" ]; then eval "GRAFT_ENV_$v=\${$v}"; fi
+done
+if [ -f "$PRIMARY/.graftrc" ]; then
+  # shellcheck disable=SC1091,SC1090
+  . "$PRIMARY/.graftrc"
+fi
+for v in $GRAFT_VARS; do
+  e="GRAFT_ENV_$v"
+  if [ -n "${!e-}" ]; then eval "$v=\${$e}"; fi
+done
+
+SUBDIR=${GRAFT_SUBDIR:-}
+SUBDIR=${SUBDIR#/}; SUBDIR=${SUBDIR%/}
+WTS="$PRIMARY/${GRAFT_WORKTREE_DIR:-.claude/worktrees}"
+PREFIX=${GRAFT_BRANCH_PREFIX-graft/}
+CLAUDE_BIN=${GRAFT_CLAUDE_BIN:-claude}
+
+# Claude Code honours CLAUDE_CONFIG_DIR for its own state; follow it so the
+# transcript bookkeeping below reads the same directory the session writes to.
+CLAUDE_DIR=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+
+if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+  echo "error: '$CLAUDE_BIN' is not on PATH." >&2
+  echo "Install Claude Code, or point GRAFT_CLAUDE_BIN at the right binary." >&2
+  exit 1
+fi
+
+# The branch worktrees fork from. origin/HEAD is the honest answer where it is
+# set; the well-known names are a fallback for repos with no remote.
+detect_base() {
+  local b
+  b=$(git -C "$PRIMARY" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null) || b=''
+  b=${b#origin/}
+  if [ -n "$b" ] && git -C "$PRIMARY" show-ref --verify --quiet "refs/heads/$b"; then
+    printf '%s' "$b"; return 0
+  fi
+  for b in main master trunk; do
+    if git -C "$PRIMARY" show-ref --verify --quiet "refs/heads/$b"; then
+      printf '%s' "$b"; return 0
+    fi
+  done
+  return 1
+}
+
+BASE=${GRAFT_BASE_BRANCH:-}
+if [ -z "$BASE" ]; then
+  BASE=$(detect_base) || {
+    echo "error: could not work out this repo's default branch." >&2
+    echo "Set GRAFT_BASE_BRANCH in $PRIMARY/.graftrc" >&2
+    exit 1
+  }
+elif ! git -C "$PRIMARY" show-ref --verify --quiet "refs/heads/$BASE"; then
+  echo "error: GRAFT_BASE_BRANCH is '$BASE', which is not a local branch." >&2
+  exit 1
+fi
+
+# Gitignored files a fresh worktree needs. Defaults follow GRAFT_SUBDIR,
+# because in a monorepo layout these live beside the app, not at the git root.
+if [ -z "${GRAFT_SEED_FILES+x}" ]; then
+  GRAFT_SEED_FILES='config/master.key .env .claude/settings.local.json .mcp.json'
+  if [ -n "$SUBDIR" ]; then
+    _seeds=''
+    for f in $GRAFT_SEED_FILES; do _seeds="$_seeds $SUBDIR/$f"; done
+    GRAFT_SEED_FILES=${_seeds# }
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Claude Code's project-directory slug: the absolute path with every
+# non-alphanumeric character replaced by a dash.
+slug_of() { printf '%s' "${1//[^A-Za-z0-9]/-}"; }
+
+lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# BSD stat first, GNU second, so this works on macOS and Linux.
+birth_of() { stat -f %B "$1" 2>/dev/null || stat -c %W "$1" 2>/dev/null || echo 0; }
+mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+
+# Epoch seconds -> "12m" / "3h" / "5d". Written as an if, not a trailing
+# (( )), because a false arithmetic command returns 1 and set -e would kill
+# the caller.
+rel() {
+  local s=${1:-0} d
+  if [ "$s" -le 0 ]; then printf -- '-'; return 0; fi
+  d=$(( $(date +%s) - s ))
+  if [ "$d" -lt 5400 ]; then printf '%dm' $(( d / 60 ))
+  elif [ "$d" -lt 172800 ]; then printf '%dh' $(( d / 3600 ))
+  else printf '%dd' $(( d / 86400 )); fi
+}
+
+# Where a session actually runs: the worktree, or a subdirectory of it.
+session_dir_of() {
+  if [ -n "$SUBDIR" ]; then printf '%s/%s' "$1" "$SUBDIR"; else printf '%s' "$1"; fi
+}
+
+project_dir_of() { printf '%s' "$CLAUDE_DIR/projects/$(slug_of "$(session_dir_of "$1")")"; }
+
+count_transcripts() {
+  local d=$1 f n=0
+  if [ ! -d "$d" ]; then echo 0; return 0; fi
+  for f in "$d"/*.jsonl; do
+    if [ -f "$f" ]; then n=$(( n + 1 )); fi
+  done
+  echo "$n"
+}
+
+newest_transcript() {
+  local d=$1 f t best=0
+  if [ ! -d "$d" ]; then echo 0; return 0; fi
+  for f in "$d"/*.jsonl; do
+    if [ -f "$f" ]; then
+      t=$(mtime_of "$f")
+      if [ "$t" -gt "$best" ]; then best=$t; fi
+    fi
+  done
+  echo "$best"
+}
+
+# Linked worktrees under the worktree dir only. The primary checkout never
+# lives there, so this excludes it structurally rather than by list position.
+# grep exits 1 on no match, which pipefail would turn into a fatal error.
+wt_paths() {
+  git -C "$PRIMARY" worktree list --porcelain 2>/dev/null \
+    | sed -n 's|^worktree ||p' \
+    | grep -F "$WTS/" || true
+}
+
+# Local branches this tool owns. Filtering in the shell rather than passing a
+# glob to for-each-ref keeps it correct for prefixes with and without a slash.
+wt_branches() {
+  local b
+  git -C "$PRIMARY" for-each-ref --format='%(refname:short)' refs/heads/ 2>/dev/null \
+    | while read -r b; do
+        case $b in "$PREFIX"?*) printf '%s\n' "${b#"$PREFIX"}" ;; esac
+      done || true
+}
+
+# Reopenable names: existing worktree directories, plus our branches whose
+# directory is gone (those can be re-attached at their original path).
+wt_names() {
+  local d n
+  for d in "$WTS"/*; do
+    if [ -d "$d" ]; then
+      n=${d##*/}
+      case $n in
+        .* | *[!A-Za-z0-9._-]*) continue ;;
+      esac
+      printf '%s\n' "$n"
+    fi
+  done
+  wt_branches | while read -r n; do
+    if [ -n "$n" ] && [ ! -d "$WTS/$n" ]; then printf '%s\n' "$n"; fi
+  done
+}
+
+# cwds of claude processes that are actually alive. A crashed session leaves a
+# stale <pid>.json behind, and the comm check also guards against pid reuse.
+live_cwds() {
+  local sf pid cwd
+  for sf in "$CLAUDE_DIR"/sessions/*.json; do
+    if [ -f "$sf" ]; then
+      pid=${sf##*/}; pid=${pid%.json}
+      case $pid in
+        '' | *[!0-9]*) continue ;;
+      esac
+      case "$(ps -p "$pid" -o comm= 2>/dev/null || true)" in
+        *claude*) ;;
+        *) continue ;;
+      esac
+      cwd=$(sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' "$sf" 2>/dev/null | sed -n 1p) || cwd=''
+      if [ -n "$cwd" ]; then printf '%s\n' "$cwd"; fi
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Names are never recycled.
+#
+# A name is taken if a directory or a local branch uses it now, if the remote
+# still carries its branch (push.default=current means a bare `git push` inside
+# a worktree publishes the worktree's branch), or if a Claude Code session was
+# EVER recorded under that path. That last check is the load-bearing one: the
+# transcript directory outlives the worktree, so it is a permanent ledger of
+# every name that has ever hosted a session.
+# ---------------------------------------------------------------------------
+ID_RE='-[01][0-9][0-3][0-9]-[0-2][0-9][0-5][0-9][a-z]?$'
+
+# Worktree paths end up inside unix domain socket paths (a Rails parallel-test
+# DRb socket, for one), and macOS gives those only 104 bytes. A short cap here
+# is much cheaper than debugging "path too long" from a test runner.
+MAX_NAME=${GRAFT_MAX_NAME:-24}
+
+name_taken() {
+  local n=$1
+  if [ -e "$WTS/$n" ]; then return 0; fi
+  if git -C "$PRIMARY" show-ref --verify --quiet "refs/heads/$PREFIX$n"; then return 0; fi
+  if git -C "$PRIMARY" show-ref --verify --quiet "refs/remotes/origin/$PREFIX$n"; then return 0; fi
+  if [ -d "$(project_dir_of "$WTS/$n")" ]; then return 0; fi
+  return 1
+}
+
+# An unused name built from label $1 ("" -> plain wt-<stamp>). Two runs in the
+# same minute are broken apart by the letter suffix.
+fresh_name() {
+  local base=$1 stamp cand suf
+  stamp=$(date +%m%d-%H%M)
+  for suf in '' b c d e f g h i j k l m n o p q r s t u v w x y z; do
+    cand="${base:-wt}-${stamp}${suf}"
+    if [ ${#cand} -le "$MAX_NAME" ] && ! name_taken "$cand"; then
+      printf '%s' "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+validate_name() {
+  local n=$1
+  case $n in
+    '' | . | ..)
+      echo "error: '$n' is not a usable worktree name" >&2; return 1 ;;
+    .* | -*)
+      echo "error: worktree name '$n' may not start with '.' or '-'" >&2; return 1 ;;
+    *[!A-Za-z0-9._-]*)
+      echo "error: worktree name '$n' — use only letters, digits, ., _, -" >&2; return 1 ;;
+  esac
+  if [ ${#n} -gt "$MAX_NAME" ]; then
+    echo "error: worktree name '$n' is ${#n} chars; the limit is $MAX_NAME." >&2
+    echo "Worktree paths carry unix socket paths, which overflow past that." >&2
+    echo "Raise it with GRAFT_MAX_NAME if your toolchain doesn't care." >&2
+    return 1
+  fi
+  return 0
+}
+
+# 0 = MATCH set, 1 = nothing matched, 2 = ambiguous (CANDS set).
+# Matches against enumerated names, never the filesystem: APFS is
+# case-insensitive, so `[ -d "$WTS/$q" ]` is true for WT-1 and the script would
+# then derive a branch that does not exist and try to create over a live path.
+MATCH=''
+CANDS=''
+resolve_name() {
+  local q=$1 lq n ln exact='' pre='' sub='' npre=0 nsub=0
+  lq=$(lower "$q")
+  MATCH=''; CANDS=''
+  for n in $(wt_names); do
+    # A literal exact match always wins, so adding wt-1a2b can never make an
+    # existing `graft wt-1` ambiguous.
+    if [ "$n" = "$q" ]; then exact=$n; continue; fi
+    ln=$(lower "$n")
+    case $ln in
+      "$lq")   exact=$n ;;
+      "$lq"*)  pre="$pre $n"; npre=$(( npre + 1 )) ;;
+      *"$lq"*) sub="$sub $n"; nsub=$(( nsub + 1 )) ;;
+    esac
+  done
+  if [ -n "$exact" ]; then MATCH=$exact; return 0; fi
+  if [ "$npre" -eq 1 ]; then MATCH=${pre# }; return 0; fi
+  if [ "$npre" -gt 1 ]; then CANDS=${pre# }; return 2; fi
+  if [ "$nsub" -eq 1 ]; then MATCH=${sub# }; return 0; fi
+  if [ "$nsub" -gt 1 ]; then CANDS=${sub# }; return 2; fi
+  return 1
+}
+
+# Most recently active worktree that actually has a transcript, so --continue
+# is never handed a directory where it is guaranteed to find nothing.
+pick_recent() {
+  local d t best='' bestt=0
+  while read -r d; do
+    if [ -n "$d" ]; then
+      t=$(newest_transcript "$(project_dir_of "$d")")
+      if [ "$t" -gt "$bestt" ]; then bestt=$t; best=${d##*/}; fi
+    fi
+  done <<EOF
+$(wt_paths)
+EOF
+  printf '%s' "$best"
+}
+
+# Deleted worktrees whose conversations survive. Names are never reissued, so
+# these stay unambiguously attributable — and recreating the path reaches them.
+orphan_note() {
+  local pre sfx d b n cnt out=''
+  pre=$(slug_of "$WTS/")
+  sfx=''
+  if [ -n "$SUBDIR" ]; then sfx=$(slug_of "/$SUBDIR"); fi
+  for d in "$CLAUDE_DIR/projects/$pre"*"$sfx"; do
+    if [ -d "$d" ]; then
+      b=${d##*/}; n=${b#"$pre"}; n=${n%"$sfx"}
+      if [ -n "$n" ] && [ ! -d "$WTS/$n" ]; then
+        cnt=$(count_transcripts "$d")
+        if [ "$cnt" -gt 0 ]; then out="$out, $n ($cnt)"; fi
+      fi
+    fi
+  done
+  if [ -n "$out" ]; then
+    echo
+    echo "  Deleted worktrees that still hold conversations:${out#,}."
+    echo "  Recreate the path to reach them: $PROG --new <name>"
+  fi
+}
+
+list_worktrees() {
+  local live cols nw w d name born ahead dirty pdir sess last what flag key
+
+  if [ -z "$(wt_paths)" ]; then
+    echo "No worktrees. Create one: $PROG"
+    orphan_note
+    return 0
+  fi
+
+  live=$(live_cwds) || live=''
+
+  nw=8
+  while read -r d; do
+    if [ -n "$d" ]; then
+      name=${d##*/}
+      if [ ${#name} -gt "$nw" ]; then nw=${#name}; fi
+    fi
+  done <<EOF
+$(wt_paths)
+EOF
+
+  cols=${COLUMNS:-0}
+  if [ "$cols" -le 0 ]; then cols=$(tput cols 2>/dev/null || echo 100); fi
+  if [ "$cols" -lt 64 ]; then cols=64; fi
+  w=$(( cols - nw - 31 ))
+  if [ "$w" -lt 12 ]; then w=12; fi
+
+  printf '  %-*s %4s %5s %5s %5s %4s  %s\n' "$nw" WORKTREE AGE LAST AHEAD DIRTY SESS WHAT
+  {
+    while read -r d; do
+      [ -n "$d" ] || continue
+      name=${d##*/}
+      born=$(birth_of "$d")
+      ahead=$(git -C "$d" rev-list --count "$BASE..HEAD" 2>/dev/null) || ahead=0
+      dirty=$(git -C "$d" status --porcelain 2>/dev/null | wc -l | tr -d ' ') || dirty=0
+      pdir=$(project_dir_of "$d")
+      sess=$(count_transcripts "$pdir")
+      last=$(newest_transcript "$pdir")
+
+      # The first commit NOT on the base branch. `log -1` would report the base
+      # tip's subject for a worktree that has committed nothing, mislabelling
+      # it confidently.
+      what=''
+      if [ "$ahead" -gt 0 ]; then
+        what=$(git -C "$d" log --reverse --format=%s "$BASE..HEAD" 2>/dev/null | sed -n 1p) || what=''
+      fi
+      if [ -z "$what" ] && [ -f "$CLAUDE_DIR/history.jsonl" ]; then
+        what=$(grep -F "\"project\":\"$(session_dir_of "$d")\"" "$CLAUDE_DIR/history.jsonl" 2>/dev/null \
+               | sed -n 's/^{"display":"\([^"]*\)".*/\1/p' \
+               | grep -v -e '^/' -e '^\[Pasted' | sed -n 1p \
+               | sed 's/\\[nrt]/ /g; s/  */ /g') || what=''
+      fi
+      if [ -z "$what" ]; then what='(nothing recorded yet)'; fi
+      if [ ${#what} -gt "$w" ]; then what="${what:0:$(( w - 2 ))}.."; fi
+
+      flag='  '
+      case $live in
+        *"$(session_dir_of "$d")"*) flag='* ' ;;
+      esac
+      if [ "$dirty" = 0 ]; then dirty='-'; fi
+      key=$last
+      if [ "$key" -le 0 ]; then key=$born; fi
+
+      printf '%s\t%s%-*s %4s %5s %5s %5s %4s  %s\n' \
+        "$key" "$flag" "$nw" "$name" "$(rel "$born")" "$(rel "$last")" \
+        "$ahead" "$dirty" "$sess" "$what"
+    done <<EOF
+$(wt_paths)
+EOF
+  } | sort -rn -k1,1 | cut -f2-
+
+  orphan_note
+  echo
+  echo "  * = claude running now.  AHEAD = commits not on $BASE.  SESS = stored conversations."
+  echo "  Branch of <name> is always $PREFIX<name>."
+  echo "  Reopen: $PROG <name>   (any unique prefix works)"
+}
+
+# ---------------------------------------------------------------------------
+# Arguments
+# ---------------------------------------------------------------------------
+NAME=''
+NEW=false
+DO_LIST=false
+while [ $# -gt 0 ]; do
+  case $1 in
+    -l | --list) DO_LIST=true; shift ;;
+    --new) NEW=true; shift ;;
+    --) shift; break ;;
+    -*) break ;;                      # a claude flag: the rest is passthrough
+    *)
+      if [ -z "$NAME" ]; then NAME=$1; shift; else break; fi ;;
+  esac
+done
+
+if $DO_LIST; then
+  list_worktrees
+  exit 0
+fi
+
+# Caught here rather than after `git worktree add`, so a mistyped GRAFT_SUBDIR
+# does not leave a dead worktree and a branch behind.
+if [ -n "$SUBDIR" ] && [ ! -d "$PRIMARY/$SUBDIR" ]; then
+  echo "error: GRAFT_SUBDIR is '$SUBDIR', but $PRIMARY/$SUBDIR does not exist." >&2
+  exit 1
+fi
+
+if [ -n "$NAME" ]; then
+  validate_name "$NAME" || exit 1
+fi
+
+# Does the passthrough imply an existing conversation?
+RESUMING=false
+for a in "$@"; do
+  case $a in
+    -c | --continue | -r | --resume | --fork-session) RESUMING=true ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# Resolve the name to one of: reopen, reattach, create
+# ---------------------------------------------------------------------------
+LABEL=$NAME   # base to regenerate from if we lose a race
+REGEN=false   # only names we generated may be redrawn
+MODE=create
+
+if [ -z "$NAME" ]; then
+  if $RESUMING && ! $NEW; then
+    # Without this, a resume flag with no name creates a brand-new empty
+    # worktree and then asks claude to continue a conversation that cannot
+    # exist there.
+    NAME=$(pick_recent)
+    if [ -z "$NAME" ]; then
+      echo "error: no worktree has a stored conversation to resume." >&2
+      echo "Start a new one with: $PROG      (no arguments)" >&2
+      echo "See what exists with:  $PROG --list" >&2
+      exit 1
+    fi
+    MODE=reopen
+    echo "No name given with a resume flag — using the most recently active worktree: $NAME"
+    echo "Not the one you meant? ctrl-C, then: $PROG --list"
+    case "$(live_cwds || true)" in
+      *"$(session_dir_of "$WTS/$NAME")"*)
+        echo "warning: a claude session is already running in $NAME — two sessions would share its working tree." >&2 ;;
+    esac
+  else
+    NAME=$(fresh_name '') || { echo "error: could not find a free worktree name" >&2; exit 1; }
+    REGEN=true
+  fi
+elif $NEW; then
+  if [[ $NAME =~ $ID_RE ]]; then
+    if name_taken "$NAME"; then
+      echo "note: '$NAME' hosted Claude sessions before — --continue there will see them." >&2
+    fi
+  else
+    NAME=$(fresh_name "$NAME") || {
+      echo "error: no free name for label '$LABEL' (limit $MAX_NAME chars incl. the -MMDD-HHMM stamp)" >&2
+      exit 1
+    }
+    REGEN=true
+  fi
+else
+  rc=0
+  resolve_name "$NAME" || rc=$?
+  if [ "$rc" -eq 2 ]; then
+    echo "error: '$NAME' matches more than one worktree: $CANDS" >&2
+    echo "Type more of the name, or: $PROG --list" >&2
+    exit 1
+  elif [ "$rc" -eq 0 ]; then
+    if [ "$MATCH" != "$NAME" ]; then echo "'$NAME' -> $MATCH"; fi
+    NAME=$MATCH
+    if [ -d "$WTS/$NAME" ]; then MODE=reopen; else MODE=reattach; fi
+  elif [[ $NAME =~ $ID_RE ]]; then
+    MODE=create                       # full ID typed back: rebuild that exact path
+    if name_taken "$NAME"; then
+      echo "note: '$NAME' hosted Claude sessions before — --continue there will see them." >&2
+    fi
+  else
+    NAME=$(fresh_name "$NAME") || {
+      echo "error: no free name for label '$LABEL' (limit $MAX_NAME chars incl. the -MMDD-HHMM stamp)" >&2
+      exit 1
+    }
+    REGEN=true
+  fi
+fi
+
+WT="$WTS/$NAME"
+BRANCH="$PREFIX$NAME"
+
+case $MODE in
+  reopen)
+    SESS=$(count_transcripts "$(project_dir_of "$WT")")
+    if [ "$SESS" -gt 0 ]; then
+      echo "Reopening $NAME ($SESS stored conversation(s); add -c to continue the last one)"
+    else
+      echo "Reopening $NAME"
+    fi
+    ;;
+
+  reattach)
+    echo "Branch $BRANCH exists but its directory is gone — re-attaching it at $WT"
+    git -C "$PRIMARY" worktree prune
+    # --no-guess-remote: with no -b and a missing local branch, git silently
+    # rewrites this to --track -b <branch> origin/<branch>, which would check
+    # out a stale remote worktree branch and point future pushes at it.
+    if ! git -C "$PRIMARY" worktree add --no-guess-remote "$WT" "$BRANCH"; then
+      echo "error: could not re-attach $BRANCH at $WT." >&2
+      echo "If it is checked out in another worktree, close that one first;" >&2
+      echo "otherwise inspect it (git log $BASE..$BRANCH) or pick another name." >&2
+      exit 1
+    fi
+    ;;
+
+  create)
+    git -C "$PRIMARY" worktree prune
+    mkdir -p "$WTS"
+    if ! git -C "$PRIMARY" check-ignore -q "${GRAFT_WORKTREE_DIR:-.claude/worktrees}" 2>/dev/null; then
+      echo "note: ${GRAFT_WORKTREE_DIR:-.claude/worktrees}/ is not gitignored — worktrees will show up as untracked files." >&2
+    fi
+    tries=0
+    while :; do
+      WT="$WTS/$NAME"
+      BRANCH="$PREFIX$NAME"
+      # mkdir(2) is the lock: it is atomic and fails EEXIST. `git worktree add`
+      # accepts an existing EMPTY directory, so a check-then-add would race.
+      if mkdir "$WT" 2>/dev/null; then
+        if git -C "$PRIMARY" worktree add -b "$BRANCH" "$WT" "$BASE"; then
+          break
+        fi
+        # rmdir, never rm -rf: if this was a race the directory is not ours.
+        rmdir "$WT" 2>/dev/null || true
+      fi
+      if ! $REGEN; then
+        echo "error: could not create worktree at $WT (see git error above)" >&2
+        exit 1
+      fi
+      tries=$(( tries + 1 ))
+      if [ "$tries" -ge 5 ]; then
+        echo "error: could not claim a unique worktree name after $tries attempts" >&2
+        exit 1
+      fi
+      NAME=$(fresh_name "$LABEL") || { echo "error: could not find a free worktree name" >&2; exit 1; }
+      echo "Name lost a race with a concurrent run — retrying as '$NAME'" >&2
+    done
+
+    echo "Created worktree $NAME"
+    echo "  path    $WT"
+    echo "  branch  $BRANCH (from $BASE)"
+    echo "  reopen  $PROG $NAME"
+    echo "  resume  $PROG $NAME -c"
+    echo "  list    $PROG --list"
+    OTHERS=$(wt_paths | wc -l | tr -d ' ')
+    OTHERS=$(( OTHERS - 1 ))
+    if [ "$OTHERS" -gt 0 ]; then
+      echo "  ($OTHERS other worktree(s) — $PROG --list)"
+    fi
+    ;;
+esac
+
+# Seed gitignored files a fresh worktree needs; never overwrite existing ones.
+# Worth keeping in sync with the repo-root .worktreeinclude, which covers the
+# worktrees Claude Code creates itself. .mcp.json matters even on reopen: MCP
+# servers connect at session startup, so a worktree without it has no MCP tools
+# at all for the whole session, and copying it mid-session is too late.
+for f in $GRAFT_SEED_FILES; do
+  if [ -f "$PRIMARY/$f" ] && [ ! -e "$WT/$f" ]; then
+    mkdir -p "$(dirname "$WT/$f")"
+    cp "$PRIMARY/$f" "$WT/$f"
+    echo "Seeded $f"
+  fi
+done
+
+RUN_DIR=$(session_dir_of "$WT")
+if [ ! -d "$RUN_DIR" ]; then
+  echo "error: $RUN_DIR does not exist in this worktree." >&2
+  echo "GRAFT_SUBDIR is '$SUBDIR' — is that right for branch $BASE?" >&2
+  exit 1
+fi
+
+cd "$RUN_DIR"
+set +e
+"$CLAUDE_BIN" "$@"
+CLAUDE_EXIT=$?
+set -e
+cd "$PRIMARY"
+
+# ---------------------------------------------------------------------------
+# Post-session cleanup, mirroring `claude --worktree`'s exit prompt.
+#
+# Every git read here is guarded: an unguarded `X=$(git -C "$WT" ...)` against a
+# directory the session removed exits 128, and under set -e that kills the
+# script before it can print anything or return CLAUDE_EXIT.
+# ---------------------------------------------------------------------------
+if [ ! -d "$WT" ]; then
+  echo "Worktree '$NAME' is gone (removed during the session)."
+  echo "Its conversations are still on disk. Rebuild the path: $PROG --new $NAME"
+  exit "$CLAUDE_EXIT"
+fi
+
+DIRTY=$(git -C "$WT" status --porcelain 2>/dev/null || true)
+UNLANDED=$(git -C "$WT" rev-list --count "$BASE..HEAD" 2>/dev/null) || UNLANDED=0
+SESS=$(count_transcripts "$(project_dir_of "$WT")")
+
+# Mid-rebase, HEAD is detached at the replay point: $BASE..HEAD under-counts
+# while status can be clean, so the delete offer would fire and `git branch -D`
+# would destroy commits that live only in the rebase state.
+BUSY=false
+if ! git -C "$WT" rev-parse --verify -q HEAD >/dev/null 2>&1; then
+  BUSY=true
+else
+  GD=$(git -C "$WT" rev-parse --absolute-git-dir 2>/dev/null || true)
+  if [ -n "$GD" ]; then
+    for f in rebase-merge rebase-apply MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD BISECT_LOG; do
+      if [ -e "$GD/$f" ]; then BUSY=true; break; fi
+    done
+  fi
+fi
+
+if $BUSY; then
+  echo "Keeping worktree '$NAME' (a rebase, merge or bisect is still in progress)."
+  echo "Reopen: $PROG $NAME"
+elif [ -n "$DIRTY" ]; then
+  echo "Keeping worktree '$NAME' (uncommitted changes). Reopen: $PROG $NAME"
+elif [ "$UNLANDED" -gt 0 ]; then
+  echo "Keeping worktree '$NAME' ($UNLANDED commit(s) not yet landed on $BASE)."
+  echo "Reopen: $PROG $NAME   Land: merge or push $BRANCH, then rerun this."
+elif [ -t 0 ]; then
+  if [ "$SESS" -gt 0 ]; then
+    echo "Worktree '$NAME' has no unlanded work."
+    echo "Its $SESS stored conversation(s) are keyed to this exact path, not to the branch."
+    echo "Deleting puts them out of reach until the path exists again — \`$PROG --new $NAME\`"
+    echo "rebuilds it from $BASE and --continue works there again (the branch's commits do"
+    echo "not come back)."
+  else
+    echo "Worktree '$NAME' has no unlanded work and no stored conversations."
+  fi
+  read -r -p "Delete worktree '$NAME' and branch $BRANCH? [y/N] " REPLY || REPLY=''
+  if [ "$REPLY" = y ] || [ "$REPLY" = Y ]; then
+    git -C "$PRIMARY" worktree remove --force "$WT"
+    git -C "$PRIMARY" branch -D "$BRANCH"
+    echo "Removed worktree '$NAME' and branch $BRANCH."
+    if [ "$SESS" -gt 0 ]; then
+      echo "Undo: $PROG --new $NAME"
+    fi
+  else
+    echo "Kept. Reopen: $PROG $NAME"
+  fi
+else
+  echo "Worktree '$NAME' has no unlanded work ($SESS stored conversation(s) keyed to its path)."
+  echo "Delete:  git worktree remove --force $WT && git branch -D $BRANCH"
+  echo "Undo:    $PROG --new $NAME"
+fi
+
+exit "$CLAUDE_EXIT"
