@@ -64,9 +64,11 @@ PROG=${0##*/}
 # Only the leading comment block is help; body comments are not.
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "$0"; }
 
+# An explicitly requested --help is a success, not a usage error: exiting
+# non-zero here breaks `graft --help && ...` and trips CI help checks.
 if [ "${1:-}" = '-h' ] || [ "${1:-}" = '--help' ]; then
   usage
-  exit 1
+  exit 0
 fi
 
 # ---------------------------------------------------------------------------
