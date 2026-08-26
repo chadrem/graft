@@ -169,9 +169,22 @@ slug_of() { printf '%s' "${1//[^A-Za-z0-9]/-}"; }
 
 lower() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]'; }
 
-# BSD stat first, GNU second, so this works on macOS and Linux.
-birth_of() { stat -f %B "$1" 2>/dev/null || stat -c %W "$1" 2>/dev/null || echo 0; }
-mtime_of() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+# BSD stat first, GNU second, so this works on macOS and Linux. The exit
+# status of the BSD attempt cannot be trusted to pick between them: GNU's -f
+# means "filesystem status", so it reads the format as a *filename*, prints a
+# block for the real argument to STDOUT, and only then fails — leaving that
+# block glued to the front of the GNU fallback's answer. So the value is what
+# decides, and it has to be all digits (GNU %W prints "-" when the filesystem
+# has no birth time). `|| v=''` because a failed assignment trips set -e.
+stat_num() {
+  local bsd=$1 gnu=$2 path=$3 v
+  v=$(stat -f "$bsd" "$path" 2>/dev/null) || v=''
+  case $v in ''|*[!0-9]*) v=$(stat -c "$gnu" "$path" 2>/dev/null) || v='' ;; esac
+  case $v in ''|*[!0-9]*) v=0 ;; esac
+  printf '%s' "$v"
+}
+birth_of() { stat_num %B %W "$1"; }
+mtime_of() { stat_num %m %Y "$1"; }
 
 # Epoch seconds -> "12m" / "3h" / "5d". Written as an if, not a trailing
 # (( )), because a false arithmetic command returns 1 and set -e would kill
