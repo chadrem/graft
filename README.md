@@ -1,30 +1,28 @@
 # graft
 
-Launch a [Claude Code](https://claude.com/claude-code) session in a throwaway
-git worktree — one worktree per task, run as many in parallel as you like, and
-never lose track of which conversation belongs to which branch.
+**One git worktree per task, for [Claude Code](https://claude.com/claude-code).**
 
-```
+`graft` creates a throwaway worktree, seeds the gitignored files a fresh
+checkout needs, starts `claude` in it, and offers to clean up when you exit. Run
+as many in parallel as you have attention for, and pick any of them back up
+later — with its conversation history intact.
+
+```console
 $ graft
-Created worktree wt-0826-0853
-  path    /repo/.claude/worktrees/wt-0826-0853
-  branch  graft/wt-0826-0853 (from main)
-  reopen  graft wt-0826-0853
-  resume  graft wt-0826-0853 -c
+Preparing worktree (new branch 'graft/wt-0826-0910')
+HEAD is now at 548a61c Initial commit
+Created worktree wt-0826-0910
+  path    ~/code/myapp/.claude/worktrees/wt-0826-0910
+  branch  graft/wt-0826-0910 (from main)
+  reopen  graft wt-0826-0910
+  resume  graft wt-0826-0910 -c
   list    graft --list
+  (3 other worktree(s) — graft --list)
 ```
 
-```
-$ graft --list
-  WORKTREE             AGE  LAST AHEAD DIRTY SESS  WHAT
-* fix-login-0826-0853   3h    2m     4    11    2  Fix the login redirect loop
-  api-0825-1710         1d    5h     1     -    1  Rework the webhook retry
-  wt-0825-0902          2d    2d     0     -    3  (nothing recorded yet)
-
-  * = claude running now.  AHEAD = commits not on main.  SESS = stored conversations.
-  Branch of <name> is always graft/<name>.
-  Reopen: graft <name>   (any unique prefix works)
-```
+You are now in a `claude` session in a clean checkout of `main`. Nothing you do
+touches your primary working tree, so the other three worktrees — and whatever
+you had half-finished in your main checkout — carry on undisturbed.
 
 ## Why not `claude --worktree`?
 
@@ -33,32 +31,26 @@ Two reasons.
 **It recycles names.** Claude Code binds a session to its literal working
 directory: transcripts live in `~/.claude/projects/<cwd-slug>/`, and
 `--continue` means "the most recent conversation in *this directory*". Reuse a
-worktree name and you pool unrelated features under one path — `--continue`
-then resumes whichever one happened to be last. graft never reuses a name.
-Generated names carry an `<MMDD>-<HHMM>` stamp, and a bare label gets one
-appended (`fix-login` → `fix-login-0826-0853`). A name counts as taken if a
-directory, a local branch or a remote branch uses it, *or* if a session was
-ever recorded under that path — the transcript directory outlives the worktree,
-so it is a permanent ledger.
+worktree name and unrelated features pool under one path, so `--continue`
+resumes whichever happened to be last. graft never reuses a name — see
+[How names work](#how-names-work).
 
-**It starts at the git root.** In a monorepo where `CLAUDE.md`, `.claude/skills/`
-and `.claude/settings.local.json` live in a subdirectory, none of that is
-discovered from the root, so your project skills silently vanish. Set
-`GRAFT_SUBDIR` and the session starts in the right place, with full parity with
-a normal `claude` run.
+**It starts at the git root.** In a monorepo where `CLAUDE.md`,
+`.claude/skills/` and `.claude/settings.local.json` live in a subdirectory, none
+of that is discovered from the root, so your project skills silently vanish. Set
+[`GRAFT_SUBDIR`](#configuration) and the session starts in the right place, at
+full parity with a normal `claude` run.
 
-It also seeds the gitignored files a fresh checkout needs (`config/master.key`,
-`.env`, `.mcp.json`, …), which otherwise leave you with a worktree that can't
-boot or has no MCP servers.
+It also seeds gitignored files (`config/master.key`, `.env`, `.mcp.json`, …),
+without which a fresh worktree may not boot, or runs with no MCP servers at all.
 
 ## Install
 
-`graft` is a single bash script with no dependencies beyond `git` and the
-`claude` CLI. Clone it and put it on your `PATH`:
+A single bash script, no dependencies beyond `git` and the `claude` CLI:
 
 ```sh
 git clone https://github.com/chadrem/graft.git ~/src/graft
-ln -s ~/src/graft/graft ~/bin/graft
+ln -s ~/src/graft/graft ~/bin/graft     # anywhere on your PATH
 ```
 
 Then, in each repo you use it from, gitignore the worktree directory:
@@ -67,72 +59,221 @@ Then, in each repo you use it from, gitignore the worktree directory:
 echo '/.claude/worktrees/' >> .gitignore
 ```
 
-## Usage
+That is the whole setup for a standard single-app repo. Monorepos and unusual
+layouts want a [`.graftrc`](#configuration).
+
+## Commands
 
 ```
 graft                    create a worktree (unique generated name)
-graft --list             what exists, what's live, what to type
-graft <name> [args]      reopen (exact, unique prefix, or substring)
-graft --new <name>       create with an explicit name, or rebuild a
-                         deleted path so its sessions resume
+graft --new <label>      create one named after what you're doing
+graft <name> [args...]   reopen (exact, unique prefix, or substring)
 graft -c                 reopen the most recently active worktree
+graft --list             what exists, what's live, what to type
 graft --help             full help
 ```
 
 Anything after the name is passed straight through to `claude`, so
-`graft fix-login -c` reopens that worktree and continues its last conversation.
+`graft fix-login -c` reopens that worktree *and* continues its last
+conversation, and `graft --new perf -p "profile the slow query"` works too.
+
+### Naming a worktree after the work
+
+```console
+$ graft --new fix-login
+Created worktree fix-login-0826-0911
+  branch  graft/fix-login-0826-0911 (from main)
+```
+
+The `-MMDD-HHMM` stamp is appended for you — that is what keeps names unique.
+
+### Reopening
 
 Because a bare argument means *reopen*, it matches loosely: exact name first,
-then unique prefix, then unique substring. `graft fix` finds
-`fix-login-0826-0853`. Use `--new` to force creation.
+then unique prefix, then unique substring.
 
-If the branch still exists but the directory is gone, graft re-attaches the
-worktree at the same path — which is exactly what an old session needs in order
-to resume, since its transcripts are keyed to that path. `graft --new <name>`
-on a name that once held sessions rebuilds the path so `--continue` reaches
-them again (the branch's commits do not come back).
+```console
+$ graft fix -c
+'fix' -> fix-login-0823-0912
+Reopening fix-login-0823-0912 (2 stored conversation(s); add -c to continue the last one)
+```
 
-## On exit
+If it is ambiguous, graft says so rather than guessing:
 
-When the session ends, graft mirrors `claude --worktree`'s cleanup. It offers
-to delete the worktree and its branch only when all three are true: no
-uncommitted changes, no rebase/merge/bisect in progress, and no commits missing
-from the base branch. Otherwise it keeps the worktree and says which of those
-stopped it. Non-interactive runs never prompt; they print the commands instead.
+```console
+$ graft wt
+error: 'wt' matches more than one worktree: wt-0826-0853 wt-0826-0853b wt-0826-0853c
+Type more of the name, or: graft --list
+```
+
+## Seeing what you have
+
+```console
+$ graft --list
+  WORKTREE             AGE  LAST AHEAD DIRTY SESS  WHAT
+* fix-login-0823-0912   2d   13m     4    11    2  Fix the login redirect loop
+  wt-0826-0803         66m   57m     0     -    3  why is the nightly digest job skippi..
+  webhooks-0825-1710   15h    5h     1     -    1  Rework the webhook retry backoff
+
+  * = claude running now.  AHEAD = commits not on main.  SESS = stored conversations.
+  Branch of <name> is always graft/<name>.
+  Reopen: graft <name>   (any unique prefix works)
+```
+
+| Column | Means |
+| --- | --- |
+| `*` | a `claude` process is running in that worktree right now |
+| `AGE` | how long ago the worktree was created |
+| `LAST` | when its most recent conversation was last written to |
+| `AHEAD` | commits on its branch that are not on the base branch |
+| `DIRTY` | uncommitted changes (`-` for none) |
+| `SESS` | stored conversations you could `-c` back into |
+| `WHAT` | the first commit not on the base branch — or, before anything is committed, your first prompt in that worktree |
+
+Rows are sorted by most recently active. `WHAT` is the column that makes a
+screen full of date-stamped names legible again three days later.
+
+## Finishing up
+
+graft does not merge, push, or open PRs — that stays yours. Land the branch the
+way you normally would (`git merge graft/fix-login-0823-0912`, push and open a
+PR, whatever your project does). Once its commits are on the base branch, the
+next exit offers cleanup.
+
+On exit it mirrors `claude --worktree`'s prompt, but only offers to delete when
+all three are true: no uncommitted changes, no rebase/merge/bisect in progress,
+and no commits missing from the base branch. Otherwise it keeps the worktree and
+tells you which one stopped it:
+
+```console
+Keeping worktree 'tokens-0826-0910' (1 commit(s) not yet landed on main).
+Reopen: graft tokens-0826-0910   Land: merge or push graft/tokens-0826-0910, then rerun this.
+```
+
+```console
+Keeping worktree 'fix-login-0823-0912' (uncommitted changes). Reopen: graft fix-login-0823-0912
+```
+
+When it is genuinely finished, it asks — and tells you what deleting costs,
+because conversations are keyed to the path rather than the branch:
+
+```console
+Worktree 'spike-0826-0910' has no unlanded work.
+Its 2 stored conversation(s) are keyed to this exact path, not to the branch.
+Deleting puts them out of reach until the path exists again — `graft --new spike-0826-0910`
+rebuilds it from main and --continue works there again (the branch's commits do
+not come back).
+Delete worktree 'spike-0826-0910' and branch graft/spike-0826-0910? [y/N]
+```
+
+Answer `n` and it is kept. Non-interactive runs never prompt; they print the
+`git worktree remove` command instead.
+
+## How names work
+
+**A name is never reused.** A name counts as taken if a directory, a local
+branch or a remote branch uses it — *or* if a Claude Code session was ever
+recorded under that path. That last check is the load-bearing one: the
+transcript directory outlives the worktree, so it is a permanent ledger of every
+name that has ever hosted a session.
+
+This is why the date stamp exists, and why `graft --new fix-login` quietly
+becomes `fix-login-0826-0911`. The cost of a collision is not a git error, it is
+`--continue` silently resuming somebody else's feature.
+
+**Deleting a worktree does not delete its conversations.** They stay on disk,
+keyed to the path. If the branch still exists but the directory is gone, graft
+re-attaches the worktree at the same path automatically. If both are gone,
+`graft --new <full-name>` rebuilds the path from the base branch so `--continue`
+reaches them again — the branch's commits do not come back, but the transcript
+does. `graft --list` reminds you which ones are in that state:
+
+```console
+  Deleted worktrees that still hold conversations: spike-0826-0910 (2).
+  Recreate the path to reach them: graft --new <name>
+```
+
+## Seeded files
+
+A fresh worktree is a clean checkout, so anything gitignored is missing from it
+— which is how you end up with a worktree that cannot boot (no credentials key)
+or that runs with no MCP tools at all. MCP servers connect at session *startup*,
+so copying `.mcp.json` in halfway through does not help.
+
+graft copies these from your primary checkout on both create and reopen, never
+overwriting a file that is already there:
+
+```
+config/master.key   .env   .claude/settings.local.json   .mcp.json
+```
+
+Override the list with [`GRAFT_SEED_FILES`](#configuration). Missing sources are
+skipped silently, so the default list is safe in a repo that has none of them.
 
 ## Configuration
 
-Set these in `<repo root>/.graftrc` (sourced as shell) or as environment
-variables, which win over the file. See [`.graftrc.example`](.graftrc.example).
+Optional. Set these in `<repo root>/.graftrc` (sourced as shell) or as
+environment variables, which win over the file. See
+[`.graftrc.example`](.graftrc.example) for a commented copy.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `GRAFT_SUBDIR` | `''` (worktree root) | Subdirectory of the worktree to start the session in. Set this for monorepos where `CLAUDE.md` and `.claude/` live below the git root. |
+| `GRAFT_SUBDIR` | *empty* (worktree root) | Subdirectory of the worktree to start the session in. Set this for monorepos where `CLAUDE.md` and `.claude/` live below the git root. |
 | `GRAFT_WORKTREE_DIR` | `.claude/worktrees` | Where worktrees are created, relative to the repo root. Gitignore it. |
-| `GRAFT_BRANCH_PREFIX` | `graft/` | Branch name prefix. `<prefix><name>`. |
-| `GRAFT_BASE_BRANCH` | `origin/HEAD`, else `main`/`master`/`trunk` | Branch new worktrees fork from, and the one "unlanded commits" is measured against. |
-| `GRAFT_SEED_FILES` | `config/master.key .env .claude/settings.local.json .mcp.json` (each under `GRAFT_SUBDIR` when set) | Space-separated gitignored files copied from the primary checkout into a new worktree. Missing sources and existing destinations are skipped. |
-| `GRAFT_MAX_NAME` | `24` | Longest permitted worktree name. Worktree paths end up inside unix domain socket paths (a Rails parallel-test DRb socket, for one) and macOS allows those only 104 bytes, so a short cap is cheaper than debugging "path too long" from a test runner. |
+| `GRAFT_BRANCH_PREFIX` | `graft/` | Branch names are `<prefix><worktree name>`. |
+| `GRAFT_BASE_BRANCH` | `origin/HEAD`, else `main`/`master`/`trunk` | Branch new worktrees fork from, and the one `AHEAD` is measured against. |
+| `GRAFT_SEED_FILES` | see [Seeded files](#seeded-files) | Space-separated gitignored files to copy in, relative to the repo root. Each default entry moves under `GRAFT_SUBDIR` when that is set. |
+| `GRAFT_MAX_NAME` | `24` | Longest permitted worktree name. |
 | `GRAFT_CLAUDE_BIN` | `claude` | The CLI to launch. |
 
-`CLAUDE_CONFIG_DIR` is honoured for locating Claude Code's own state.
+`CLAUDE_CONFIG_DIR` is honoured when locating Claude Code's own state.
 
-### Rails monorepo example
+### Monorepo example
 
-For a repo laid out as `myrepo/{web,worker}` where the Rails app is in `web/`:
+For a repo laid out as `myrepo/{web,worker}`, where the Rails app and all its
+Claude config live in `web/`:
 
 ```sh
 # myrepo/.graftrc
 GRAFT_SUBDIR=web
-GRAFT_SEED_FILES='web/config/master.key web/.env web/.claude/settings.local.json web/.mcp.json'
 ```
+
+That is enough — the seed-file defaults follow `GRAFT_SUBDIR`, so they become
+`web/config/master.key`, `web/.env` and so on. Sessions start in
+`<worktree>/web`, where your `CLAUDE.md` and skills actually are.
+
+### Why the 24-character name limit
+
+Worktree paths end up inside unix domain socket paths — a Rails parallel-test
+DRb socket, for one — and macOS allows those only 104 bytes total. A short cap
+here is much cheaper than debugging "path too long" from a test runner an hour
+later. Raise `GRAFT_MAX_NAME` if your toolchain does not care.
+
+## Troubleshooting
+
+**Worktrees show up as untracked files.** The worktree directory is not
+gitignored. graft warns about this on create; add `/.claude/worktrees/` to
+`.gitignore`.
+
+**`error: GRAFT_SUBDIR is 'web', but …/web does not exist`.** Either a typo, or
+you are running from a checkout where that directory genuinely is not present.
+graft checks before creating anything, so nothing is left behind.
+
+**`error: could not work out this repo's default branch`.** No `origin/HEAD` and
+no local `main`, `master` or `trunk`. Set `GRAFT_BASE_BRANCH`.
+
+**A worktree is stuck being kept.** Something in it is unfinished. `graft --list`
+shows which — `DIRTY` for uncommitted changes, `AHEAD` for unlanded commits — and
+an in-progress rebase or merge is reported on exit.
 
 ## Requirements
 
-- bash 3.2+ (ships with macOS) — tested on macOS and Linux
-- git 2.5+ (worktree support)
+- bash 3.2+ (the version macOS ships) — tested on macOS and Linux
+- git 2.5+, for worktree support
 - the `claude` CLI on your `PATH`
 
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE).
+
+Not affiliated with Anthropic.
