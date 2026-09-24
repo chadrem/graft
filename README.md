@@ -26,23 +26,30 @@ you had half-finished in your main checkout — carry on undisturbed.
 
 ## Why not `claude --worktree`?
 
-Two reasons.
+Claude Code's built-in worktrees are good, and need nothing installed. graft
+adds a few things on top:
 
-**It recycles names.** Claude Code binds a session to its literal working
-directory: transcripts live in `~/.claude/projects/<cwd-slug>/`, and
-`--continue` means "the most recent conversation in *this directory*". Reuse a
-worktree name and unrelated features pool under one path, so `--continue`
-resumes whichever happened to be last. graft never reuses a name — see
-[How names work](#how-names-work).
+- **Names are never reused.** Claude Code reopens a worktree if you reuse its
+  name, and `--continue` picks the latest chat in that folder, which may be a
+  different task. graft makes every name unique. See
+  [How names work](#how-names-work).
+- **Monorepo support.** Claude Code always starts at the git root, so a
+  `CLAUDE.md` or `.claude/skills/` in a subfolder is never found. Set
+  [`GRAFT_SUBDIR`](#configuration) and graft starts there instead.
+- **Ignored files with no setup.** graft copies `.env`, `config/master.key`,
+  `.mcp.json` and friends on create and on every reopen. Claude Code needs a
+  `.worktreeinclude` file first, and copies only on create.
+- **A status list.** `graft --list` shows every worktree: whether claude is
+  running, commits ahead, uncommitted changes, saved chats, and what it's for.
+- **Easy reopen.** Type any unique part of a name, or `graft -c` for the last
+  one. Claude Code needs the exact name.
+- **Safer cleanup.** graft only offers to delete a worktree once its work is
+  on the base branch, and tells you why it kept one.
+- **Chats come back.** If you delete a worktree, graft can rebuild its path so
+  its old chats work again.
 
-**It starts at the git root.** In a monorepo where `CLAUDE.md`,
-`.claude/skills/` and `.claude/settings.local.json` live in a subdirectory, none
-of that is discovered from the root, so your project skills silently vanish. Set
-[`GRAFT_SUBDIR`](#configuration) and the session starts in the right place, at
-full parity with a normal `claude` run.
-
-It also seeds gitignored files (`config/master.key`, `.env`, `.mcp.json`, …),
-without which a fresh worktree may not boot, or runs with no MCP servers at all.
+Use the built-in feature if you want worktrees in the desktop app, for
+subagents, or with no extra tool.
 
 ## Install
 
