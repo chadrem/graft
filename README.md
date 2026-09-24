@@ -279,6 +279,11 @@ an in-progress rebase or merge is reported on exit.
 - git 2.5+, for worktree support
 - the `claude` CLI on your `PATH`
 
+## Testing
+
+`test/list.sh` smoke-tests `graft --list` in a throwaway repo. CI runs it on
+Linux and macOS.
+
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE).
