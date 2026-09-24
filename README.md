@@ -281,8 +281,14 @@ an in-progress rebase or merge is reported on exit.
 
 ## Testing
 
-`test/list.sh` smoke-tests `graft --list` in a throwaway repo. CI runs it on
-Linux and macOS.
+```sh
+test/run.sh            # the whole suite (about 65 tests, ~30s)
+test/run.sh reopen     # only tests whose name contains "reopen"
+```
+
+Plain bash, nothing to install. Each test gets a throwaway repo and a fake
+`claude` that records how it was launched. CI runs the suite on Linux and
+macOS.
 
 ## License
 

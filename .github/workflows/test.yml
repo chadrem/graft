@@ -13,4 +13,4 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - run: test/list.sh
+      - run: test/run.sh
